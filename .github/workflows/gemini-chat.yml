@@ -6,7 +6,7 @@ name: Gemini chat
 #
 # Gemini reads the repository (default branch) plus the issue/PR text and replies as a new comment.
 #
-# One-time setup: add a repository secret named GEMINI_API_KEY (Settings > Secrets and variables > Actions).
+# One-time setup: add a repository secret named VERTEX_API_KEY (Settings > Secrets and variables > Actions).
 #
 # Safety: only repo OWNER / MEMBER / COLLABORATOR comments can trigger it, and comments on pull requests
 # from forks are ignored (forks cannot read secrets). The workspace is trusted, which makes Gemini CLI
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      HAS_GEMINI: ${{ secrets.GEMINI_API_KEY != '' }}
+      HAS_GEMINI: ${{ secrets.VERTEX_API_KEY != '' }}
       NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
     steps:
       - name: Check out the default branch
@@ -54,7 +54,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh issue comment "$NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --body "Gemini chat is not set up yet: add a repository secret named \`GEMINI_API_KEY\` (Settings > Secrets and variables > Actions)."
+            --body "Gemini chat is not set up yet: add a repository secret named \`VERTEX_API_KEY\` (Settings > Secrets and variables > Actions)."
           exit 1
 
       - name: Ask Gemini
@@ -66,7 +66,7 @@ jobs:
           # default branch (never fork code), and only trusted commenters can trigger it.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
-          gemini_api_key: ${{ secrets.VERTEX_API_KEY }}
+          vertex_api_key: ${{ secrets.VERTEX_API_KEY }}
           settings: |
             { "maxSessionTurns": 15, "tools": { "exclude": ["run_shell_command", "write_file", "replace"] } }
           prompt: |
