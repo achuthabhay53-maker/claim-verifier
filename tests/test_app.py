@@ -52,3 +52,5 @@ def test_results_page_renders_papers_summary_and_error_rows():
     assert any("failed to analyze" in e.value for e in at.error)       # ERROR paper is surfaced
     assert any("Second search" in e.value for e in at.error)           # failed second search shown
     assert len(at.metric) == len(ev.LABELS)
+    assert any("Only 2 paper(s) found" in w.value for w in at.warning)      # too few papers were found
+    assert any("were checked, so treat this answer as inconclusive" in w.value for w in at.warning)

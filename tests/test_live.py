@@ -25,9 +25,12 @@ def test_semantic_scholar_search():
     assert isinstance(papers, list)
 
 
-def test_claude_can_decompose_a_claim():
-    key = os.environ.get("ANTHROPIC_API_KEY")
+def test_gemini_can_decompose_a_claim():
+    key = os.environ.get("VERTEX_API_KEY")
     if not key:
-        pytest.skip("ANTHROPIC_API_KEY not set")
-    info = ev.decompose_claim(ev._client(key), "claude-sonnet-5-5", "VR training improves surgical skills.")
+        pytest.skip("VERTEX_API_KEY not set")
+    try:
+        info = ev.decompose_claim(ev._client(key), ev.DEFAULT_MODEL, "VR training improves surgical skills.")
+    except ValueError as e:  # still rate limited after retries: a quota issue, not a code bug
+        pytest.skip(f"Gemini unavailable: {e}")
     assert 1 <= info["required_outcome_level"] <= 5

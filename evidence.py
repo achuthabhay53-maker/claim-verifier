@@ -9,12 +9,17 @@ Pipeline
   5. summarize()         -> overall answer for the claim
 """
 import concurrent.futures as cf
+import json
+import random
 import re
+import time
 
-import anthropic
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 
 from find_papers import _key as paper_key
-from find_papers import log, run_search
+from find_papers import enrich_citations, log, run_search
 
 LABELS = ["SUPPORTS", "PARTIALLY_SUPPORTS", "CONTRADICTS", "MIXED", "IRRELEVANT", "INSUFFICIENT_EVIDENCE"]
 LABEL_ICON = {"SUPPORTS": "🟢", "PARTIALLY_SUPPORTS": "🟡", "CONTRADICTS": "🔴", "MIXED": "🟠",
@@ -75,6 +80,12 @@ PAPER_TOOL = {
                 "type": "string", "enum": ["matches", "partial", "not_matching", "none"],
                 "description": ("matches = compared against what the claim names. partial = some comparison arms match, others do not. "
                                 "not_matching = compared against something else. none = no comparison group.")},
+            "population_match": {
+                "type": "string", "enum": ["matches", "partial", "different"],
+                "description": ("Does the paper study the kind of people the claim is about? "
+                                "matches = same group (or the claim names no group). "
+                                "partial = a related group (e.g. medical students or another procedural specialty for a claim about surgical trainees). "
+                                "different = a clearly different group (e.g. patients, or an unrelated profession).")},
             "outcomes": {
                 "type": "array",
                 "description": "Outcomes with RESULTS reported in the abstract. Do NOT list outcomes only mentioned as hopes, future work, or motivation.",
@@ -98,7 +109,7 @@ PAPER_TOOL = {
                        "description": "1-3 sentences copied EXACTLY from the abstract that are the key evidence."},
         },
         "required": ["study_design", "population", "intervention", "intervention_match", "comparator",
-                     "comparator_match", "outcomes", "proposed_label", "directness", "rationale",
+                     "comparator_match", "population_match", "outcomes", "proposed_label", "directness", "rationale",
                      "limitations", "quotes"],
     },
 }
@@ -114,23 +125,47 @@ SYSTEM = (
 )
 
 
-def _client(api_key: str) -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=api_key, max_retries=4, timeout=90)
+DEFAULT_MODEL = "gemini-3.5-flash"
+RETRYABLE_CODES = {429, 500, 502, 503, 504}
 
 
-def _call_tool(client, model: str, tool: dict, user: str) -> dict:
-    # This model rejects forced tool_choice, so ask for the tool in the prompt and retry once if it is skipped.
-    prompt = user + f"\n\nRespond by calling the `{tool['name']}` tool. Do not write any other text."
-    for attempt in (1, 2):
-        msg = client.messages.create(
-            model=model, max_tokens=2500, system=SYSTEM, tools=[tool],
-            messages=[{"role": "user", "content": prompt}],
-        )
-        for block in msg.content:
-            if block.type == "tool_use":
-                return block.input
-        log.warning("No tool call from model (attempt %d, stop_reason=%s)", attempt, msg.stop_reason)
-    raise ValueError(f"model did not return structured output (stop_reason={msg.stop_reason})")
+def _client(api_key: str):
+    """Gemini through a Vertex AI API key (express mode)."""
+    return genai.Client(vertexai=True, api_key=api_key, http_options=types.HttpOptions(timeout=90_000))
+
+
+def _call_tool(client, model: str, tool: dict, user: str, max_attempts: int = 5) -> dict:
+    """Ask Gemini for JSON that matches the tool's schema.
+    Rate limits and server errors are retried with backoff, and so is unusable output (empty or bad JSON).
+    Auth, billing and wrong-model-name errors fail immediately with the original error."""
+    config = types.GenerateContentConfig(system_instruction=SYSTEM, response_mime_type="application/json",
+                                         response_json_schema=tool["input_schema"])
+    last = "unknown error"
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.models.generate_content(model=model, contents=user, config=config)
+        except genai_errors.APIError as e:
+            if e.code not in RETRYABLE_CODES:
+                raise
+            last = f"HTTP {e.code}"
+        else:
+            text = getattr(resp, "text", None)
+            if not text:
+                last = "empty response (blocked or no text)"
+            else:
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    last = "response was not valid JSON"
+                else:
+                    if isinstance(data, dict):
+                        return data
+                    last = "response JSON was not an object"
+        if attempt < max_attempts:
+            wait = min(2 ** attempt, 30) + random.random()
+            log.warning("Gemini call problem (%s); retrying in %.0fs (attempt %d/%d)", last, wait, attempt, max_attempts)
+            time.sleep(wait)
+    raise ValueError(f"model did not return usable structured output after {max_attempts} attempts ({last})")
 
 
 def decompose_claim(client, model: str, claim: str) -> dict:
@@ -153,6 +188,7 @@ def extract_facts(client, model: str, claim: str, claim_info: dict, paper: dict)
 def _norm(s: str) -> str:
     s = s.lower().replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
     s = s.replace("–", "-").replace("—", "-").replace(" ", " ")
+    s = s.replace("−", "-").replace("≥", ">=").replace("≤", "<=")  # minus sign, >=, <=
     return re.sub(r"\s+", " ", s).strip(" .\"'")
 
 
@@ -170,6 +206,8 @@ def verify_quotes(quotes: list[str], abstract: str) -> tuple[list[str], list[str
 
 # ------------------------------------------------------------ guardrails
 SUPPORTIVE = {"SUPPORTS", "PARTIALLY_SUPPORTS"}
+SMALL_STUDY_N = 30            # below this, a non-review study cannot rule a claim out
+THIN_RESULT_THRESHOLD = 8     # fewer checked papers than this = treat the answer as inconclusive
 
 
 def max_level(facts: dict) -> int:
@@ -203,6 +241,9 @@ def apply_guardrails(claim_info: dict, facts: dict) -> dict:
     req = claim_info["required_outcome_level"]
     got = max_level(facts)
     im, cm = facts.get("intervention_match"), facts.get("comparator_match")
+    pm = facts.get("population_match", "matches")  # older results may not have it
+    is_review = facts.get("study_design") in ("meta_analysis", "systematic_review")
+    small = not is_review and 0 < (facts.get("sample_size") or 0) < SMALL_STUDY_N
 
     def downgrade(new: str, why: str):
         nonlocal label
@@ -222,11 +263,26 @@ def apply_guardrails(claim_info: dict, facts: dict) -> dict:
                 downgrade("PARTIALLY_SUPPORTS",
                           "intervention is a " + ("related variant" if im == "variant" else "mix of modalities")
                           + ", not exactly what the claim states")
+            elif pm in ("partial", "different"):
+                downgrade("PARTIALLY_SUPPORTS", "study population is " +
+                          ("only a related group to" if pm == "partial" else "different from") +
+                          " the claim's population")
             elif cm in ("partial", "not_matching", "none"):
                 downgrade("PARTIALLY_SUPPORTS", f"comparator does not fully match the claim ({cm})")
-    if im in ("variant", "mixed") and directness == "direct":
+        elif label == "CONTRADICTS":
+            # Evidence AGAINST a claim needs the same care as evidence for it: a null result from a mismatched
+            # or tiny study cannot rule the claim out.
+            if im in ("variant", "mixed"):
+                downgrade("MIXED", "intervention only partly matches the claim, so the evidence against it is indirect")
+            elif pm in ("partial", "different"):
+                downgrade("MIXED", "study population differs from the claim's, so the evidence against it is indirect")
+            elif cm in ("partial", "not_matching", "none"):
+                downgrade("MIXED", f"comparator does not match the claim ({cm}), so the evidence against it is indirect")
+            elif small:
+                downgrade("MIXED", f"small study (n<{SMALL_STUDY_N}): a null result cannot rule out a benefit")
+    if directness == "direct" and (im in ("variant", "mixed") or pm in ("partial", "different")):
         directness = "indirect"
-        notes.append("directness set to indirect: intervention only partly matches the claim")
+        notes.append("directness set to indirect: intervention or population only partly matches the claim")
     return {"label": label, "directness": directness, "strength": strength_of(facts, label, directness),
             "max_outcome_level": got, "guardrail_notes": notes}
 
@@ -242,7 +298,7 @@ def analyze_paper(client, model, claim, claim_info, paper) -> dict:
     return {**facts, **final, "model_label": facts["proposed_label"], "quotes_verified": ok, "quotes_unverified": bad}
 
 
-def analyze_papers(api_key: str, model: str, claim: str, papers: list[dict], progress_cb=None, workers: int = 4,
+def analyze_papers(api_key: str, model: str, claim: str, papers: list[dict], progress_cb=None, workers: int = 3,
                    claim_info: dict | None = None, indices=None):
     """Returns (claim_info, {paper_index: result}). A failure on one paper never stops the others.
     Pass claim_info + indices to analyze only some papers (used by the second search)."""
@@ -298,9 +354,20 @@ def build_query(info: dict) -> str:
     """Build the boolean query in code so the parentheses are always right:
     (intervention OR ...) AND (context OR ...) AND (outcome OR ...), every term quoted and field-tagged."""
     def group(terms):
-        clean = [t.strip().replace('"', "") for t in terms if t and t.strip()]
-        return "(" + " OR ".join(f'"{t}"[tiab]' for t in clean) + ")"
-    return " AND ".join(group(info[k]) for k in ("intervention_terms", "context_terms", "outcome_terms"))
+        clean = [t.strip().replace('"', "") for t in terms or [] if t and t.strip()]
+        return "(" + " OR ".join(f'"{t}"[tiab]' for t in clean) + ")" if clean else ""
+    groups = (group(info.get(k)) for k in ("intervention_terms", "context_terms", "outcome_terms"))
+    return " AND ".join(g for g in groups if g)
+
+
+def search_queries(info: dict, relaxed: bool = False) -> dict:
+    """One query per source: PubMed gets the tagged boolean query; Semantic Scholar does not understand
+    PubMed tags, so it gets a short plain keyword string. `relaxed` drops the outcome terms (broader search)."""
+    if relaxed:
+        info = {**info, "outcome_terms": []}
+    first = lambda k: ((info.get(k) or [""])[0] or "").strip()
+    plain = " ".join(x for x in (first("intervention_terms"), first("context_terms"), first("outcome_terms")) if x)
+    return {"pubmed": build_query(info), "semanticscholar": plain}
 
 
 def deeper_pass(api_key: str, model: str, claim: str, claim_info: dict, papers: list[dict], limit: int,
@@ -312,9 +379,10 @@ def deeper_pass(api_key: str, model: str, claim: str, claim_info: dict, papers: 
                       f"Claim: {claim}\nIntervention: {claim_info['intervention']}\n"
                       f"Outcome needed: {claim_info['outcome']} (level {claim_info['required_outcome_level']}: "
                       f"{OUTCOME_LEVELS[claim_info['required_outcome_level']]})\nPopulation: {claim_info['population']}")
-    query = build_query(info)
-    log.info("Deeper search query: %s", query)
-    found, errors = run_search(query, limit, medical, enrich)
+    queries = search_queries(info)
+    query = queries["pubmed"]
+    log.info("Deeper search queries: %s", queries)
+    found, errors = run_search(queries, limit, medical, enrich)
     seen = {paper_key(p) for p in papers}
     new = [p for p in found if paper_key(p) not in seen and (p.get("abstract") or not only_abstract)]
     log.info("Deeper search: %d found, %d new after dedupe/abstract filter", len(found), len(new))
@@ -327,6 +395,38 @@ def deeper_pass(api_key: str, model: str, claim: str, claim_info: dict, papers: 
                                     indices=range(start, start + len(new)))
     return {"query": query, "explanation": info.get("explanation", ""), "papers": new, "results": results,
             "errors": errors, "found": len(found)}
+
+
+def plan_and_search(api_key: str, model: str, claim: str, limit: int, medical: bool, enrich: bool,
+                    min_results: int = THIN_RESULT_THRESHOLD):
+    """Turn the claim into a structured keyword search instead of sending the raw sentence (PubMed requires
+    every word of a sentence, which finds almost nothing). If the precise query returns fewer than
+    `min_results` papers, retry once with the outcome terms dropped. Returns (papers, errors, plan)."""
+    client = _client(api_key)
+    info = _call_tool(client, model, QUERY_TOOL,
+                      f"Claim: {claim}\n\nList search terms for finding papers that test this claim. "
+                      "intervention_terms: the intervention and its common synonyms and abbreviations. "
+                      "context_terms: the field or setting. outcome_terms: the outcome the claim talks about, with "
+                      "synonyms. Use short noun phrases (no verbs such as 'improves' or 'reduces').")
+    precise = search_queries(info)
+    if not precise["pubmed"]:
+        raise ValueError("model returned no usable search terms")
+    log.info("Search plan: %s", info)
+    papers, errors = run_search(precise, limit, medical, enrich=False)
+    plan = {"explanation": info.get("explanation", ""), "terms": info, "precise": precise["pubmed"],
+            "precise_count": len(papers), "relaxed": None, "relaxed_count": None, "relaxed_used": False,
+            "queries": precise}
+    if len(papers) < min_results:
+        relaxed = search_queries(info, relaxed=True)
+        log.info("Only %d papers from the precise query; retrying without outcome terms", len(papers))
+        more, more_errors = run_search(relaxed, limit, medical, enrich=False)
+        plan.update(relaxed=relaxed["pubmed"], relaxed_count=len(more))
+        if len(more) > len(papers):
+            papers, errors = more, more_errors
+            plan.update(relaxed_used=True, queries=relaxed)
+    if enrich and papers:
+        enrich_citations(papers)
+    return papers, errors, plan
 
 
 def summarize(claim_info: dict, results: dict, deeper_query: str | None = None) -> dict:
@@ -352,5 +452,6 @@ def summarize(claim_info: dict, results: dict, deeper_query: str | None = None) 
     # Trigger for the second search: nothing on-topic backs (or contradicts) the claim at the level it needs.
     answered = any(r["label"] in ("SUPPORTS", "PARTIALLY_SUPPORTS", "CONTRADICTS", "MIXED")
                    and r["max_outcome_level"] >= req for r in results.values())
+    n_checked = sum(1 for r in results.values() if r["label"] != "ERROR")
     return {"counts": counts, "best_level": best, "required_level": req, "headline": head,
-            "needs_deeper": not answered}
+            "needs_deeper": not answered, "n_checked": n_checked, "thin": n_checked < THIN_RESULT_THRESHOLD}

@@ -7,7 +7,8 @@ import os
 import pandas as pd
 import streamlit as st
 
-from evidence import LABEL_ICON, LABELS, LEVEL_SHORT, OUTCOME_LEVELS, analyze_papers, deeper_pass, summarize
+from evidence import (DEFAULT_MODEL, LABEL_ICON, LABELS, LEVEL_SHORT, OUTCOME_LEVELS, THIN_RESULT_THRESHOLD,
+                      analyze_papers, deeper_pass, plan_and_search, summarize)
 from find_papers import LOG_FILE, is_medical, log, run_search, s2_key
 
 st.set_page_config(page_title="Claim Evidence Finder", page_icon="🔬", layout="wide")
@@ -31,8 +32,9 @@ with st.sidebar:
                               help="If no paper reaches the outcome level the claim needs, run one more search "
                                    "aimed at that outcome (e.g. complications, survival) and check the new papers.")
     st.divider()
-    api_key = st.text_input("Anthropic API key", value=os.environ.get("ANTHROPIC_API_KEY", ""), type="password")
-    model = st.text_input("Model", "claude-sonnet-5-5")
+    api_key = st.text_input("Vertex API key", value=os.environ.get("VERTEX_API_KEY", ""), type="password",
+                            help="Vertex AI API key (Gemini). Loaded from VERTEX_API_KEY in .env when present.")
+    model = st.text_input("Gemini model", DEFAULT_MODEL)
     with st.expander("Outcome levels used"):
         for k, v in OUTCOME_LEVELS.items():
             st.markdown(f"**{k}** – {v}")
@@ -42,12 +44,27 @@ claim = st.text_area("Your claim", height=80,
 query = st.text_input("Search query (optional — defaults to the claim)")
 
 if st.button("1. Search papers", type="primary", disabled=not claim.strip()):
-    q = query.strip() or claim.strip()
+    custom = query.strip()
+    q = custom or claim.strip()
     medical = is_medical(claim + " " + q) if topic.startswith("Auto") else topic.startswith("Medical")
-    log.info("UI search: claim=%r query=%r topic=%s medical=%s limit=%d", claim, q, topic, medical, limit)
+    log.info("UI search: claim=%r custom_query=%r topic=%s medical=%s limit=%d", claim, custom, topic, medical, limit)
     st.info("Medical topic → searching PubMed only." if medical else "General topic → searching PubMed + Semantic Scholar.")
+    plan = None
     with st.spinner("Searching..."):
-        papers, errors = run_search(q, limit, medical, enrich=enrich)
+        if custom:
+            papers, errors = run_search(custom, limit, medical, enrich=enrich)  # your own query is used as typed
+        elif not api_key:
+            st.info("No Vertex key, so the claim sentence was used as the query. Results may be few: "
+                    "PubMed needs every word of a sentence. Add a key for a smarter keyword search.")
+            papers, errors = run_search(q, limit, medical, enrich=enrich)
+        else:
+            try:
+                papers, errors, plan = plan_and_search(api_key, model, claim.strip(), limit, medical, enrich)
+            except Exception as e:
+                log.exception("Search planning failed; falling back to the claim sentence")
+                st.warning(f"Could not build a keyword search ({e.__class__.__name__}: {e}); "
+                           "the claim sentence was used instead.")
+                papers, errors = run_search(q, limit, medical, enrich=enrich)
     for err in errors:
         st.error(f"⚠️ {err}  (details in the log below)")
     if not papers and not errors:
@@ -56,13 +73,31 @@ if st.button("1. Search papers", type="primary", disabled=not claim.strip()):
         before = len(papers)
         papers = [p for p in papers if p.get("abstract")]
         log.info("Abstract filter: %d -> %d", before, len(papers))
-    st.session_state.update(papers=papers, claim=claim.strip(), analysis=None, medical=medical)
+    st.session_state.update(papers=papers, claim=claim.strip(), analysis=None, medical=medical, plan=plan)
 
 papers = st.session_state.get("papers")
 if papers is not None:
     st.subheader(f"{len(papers)} papers found")
+    plan = st.session_state.get("plan")
+    if plan:
+        with st.expander("🔎 How the search was built", expanded=len(papers) < THIN_RESULT_THRESHOLD):
+            st.markdown(plan["explanation"] or "Keyword search built from your claim.")
+            st.markdown("**PubMed query**")
+            st.code(plan["queries"]["pubmed"], language="text")
+            if not st.session_state.get("medical", True):
+                st.markdown("**Semantic Scholar query**")
+                st.code(plan["queries"]["semanticscholar"], language="text")
+            msg = f"The precise query found {plan['precise_count']} papers."
+            if plan["relaxed"] is not None:
+                msg += (f" That is below {THIN_RESULT_THRESHOLD}, so it was retried without the outcome terms "
+                        f"(found {plan['relaxed_count']})" + ("; the broader results are shown." if plan["relaxed_used"]
+                                                              else "; the precise results were kept."))
+            st.caption(msg)
+    if len(papers) < THIN_RESULT_THRESHOLD:
+        st.warning(f"Only {len(papers)} paper(s) found. That is too few for a reliable answer. "
+                   "Raise 'Results per source' or write a broader query.")
     if not api_key:
-        st.info("Add an Anthropic API key in the sidebar to enable evidence validation.")
+        st.info("Add a Vertex API key in the sidebar to enable evidence validation.")
 
     if st.button("2. Validate evidence for the claim", type="primary", disabled=not (api_key and papers)):
         bar = st.progress(0.0, text="Analyzing claim and papers...")
@@ -95,6 +130,9 @@ if analysis and papers:
 
     st.header("Result")
     (st.warning if summ["best_level"] < summ["required_level"] else st.success)(summ["headline"])
+    if summ["thin"]:
+        st.warning(f"⚠️ Only {summ['n_checked']} paper(s) were checked, so treat this answer as inconclusive. "
+                   "Broaden the search and validate again.")
 
     dp = analysis.get("deeper")
     if dp:
@@ -128,6 +166,7 @@ if analysis and papers:
             "Label": f"{LABEL_ICON[r['label']]} {r['label']}", "Strength": r["strength"], "Directness": r["directness"],
             "Design": r.get("study_design", ""), "N": r.get("sample_size"),
             "Intervention match": r.get("intervention_match", ""), "Comparator match": r.get("comparator_match", ""),
+            "Population match": r.get("population_match", ""),
             "Best outcome level": f"{r['max_outcome_level']} ({LEVEL_SHORT[r['max_outcome_level']]})",
             "Search": p.get("round", 1),
             "Year": p.get("year"), "Citations": p.get("citations"), "Title": p["title"],
@@ -164,7 +203,7 @@ if analysis and papers:
             if r["label"] != "ERROR":
                 a, b = st.columns(2)
                 a.markdown(f"**Design:** {r.get('study_design')} · **N:** {r.get('sample_size') or 'n/r'}  \n"
-                           f"**Population:** {r.get('population')}  \n"
+                           f"**Population:** {r.get('population')} _(match: {r.get('population_match', 'n/a')})_  \n"
                            f"**Intervention:** {r.get('intervention')} _(match: {r.get('intervention_match')})_  \n"
                            f"**Comparator:** {r.get('comparator')} _(match: {r.get('comparator_match')})_")
                 outs = "\n".join(f"- L{o['level']} {o['name']} → {o['result']}" for o in r.get("outcomes", [])) or "- none reported"

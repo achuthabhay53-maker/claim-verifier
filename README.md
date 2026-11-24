@@ -15,18 +15,26 @@ It is built as an evidence-validation tool, not a paper summarizer. For each pap
 claim ──► 1. Search ──► 2. Validate ──► 3. Second search (automatic, only if needed)
 ```
 
-**1. Search** ([find_papers.py](find_papers.py))
+**1. Search** ([find_papers.py](find_papers.py), [evidence.py](evidence.py))
+- The claim is **not** sent to PubMed as a sentence. PubMed requires every word, so a full sentence often finds only
+  a handful of papers. Gemini instead lists search terms and synonyms, and the app builds
+  `(intervention terms) AND (setting terms) AND (outcome terms)`. If that finds fewer than 8 papers, it retries once
+  without the outcome terms. The page shows the query that was used. A query you type yourself is used as typed.
 - Medical topics search **PubMed only**. All other topics search **PubMed + Semantic Scholar**.
   The topic is auto-detected from keywords and can be overridden in the sidebar.
 - Results are merged and de-duplicated (by DOI, then PMID, then title).
 - Citation counts are added with a Semantic Scholar lookup by DOI/PMID (PubMed has no citation counts).
 
 **2. Validate** ([evidence.py](evidence.py))
-- Claude splits the claim into **intervention, comparator, outcome, population** and decides which
+- Gemini splits the claim into **intervention, comparator, outcome, population** and decides which
   **outcome level** the claim needs (see below).
-- For every paper, Claude fills in a structured checklist: study design, sample size, intervention,
+- For every paper, Gemini fills in a structured checklist: study design, sample size, intervention,
   comparator, the outcomes actually measured, limitations and key quotes.
-- Rules written in code then downgrade over-generous labels. Every downgrade shows its reason on the page.
+- Rules written in code then downgrade over-generous labels. Every downgrade shows its reason on the page. They check
+  the intervention, the comparator, the **population** (for example anaesthesia residents are not surgical trainees),
+  and the outcome level. Evidence **against** a claim gets the same care: a null result from a mismatched or small
+  study (fewer than 30 people) is capped at `MIXED`, because it cannot rule a benefit out.
+- If fewer than 8 papers were found or checked, the page warns that the answer is inconclusive.
 - Each quote is checked to appear **word for word** in the abstract. Invented quotes are flagged.
 
 **3. Second search**
@@ -73,11 +81,12 @@ copy .env.example .env      # then fill in your keys
 
 ```
 S2_API_KEY=...          # Semantic Scholar key; free, avoids rate limiting
-ANTHROPIC_API_KEY=...   # used for claim analysis and evidence validation
+VERTEX_API_KEY=...      # Vertex AI API key (Gemini); used for claim analysis and evidence validation
 ```
 
 Both keys are optional to start: without `S2_API_KEY` searches still work but are rate-limited, and without
-`ANTHROPIC_API_KEY` you can search but not validate. You can also paste the Anthropic key in the sidebar.
+`VERTEX_API_KEY` you can search but not validate. You can also paste the Vertex key in the sidebar.
+The default model is `gemini-3.5-flash`; change it in the sidebar if your key has access to another one.
 
 ## Run
 
@@ -91,7 +100,8 @@ Use the `.venv` interpreter every time. A different Python can have different pa
 confusing errors.
 
 Then:
-1. Enter your claim (optionally a custom search query, which can be a PubMed boolean query).
+1. Enter your claim. Leave the search box empty for the automatic keyword search, or type your own query
+   (it can be a PubMed boolean query).
 2. Click **1. Search papers**.
 3. Click **2. Validate evidence for the claim**.
 4. Read the headline result, the table (downloadable as CSV) and the per-paper details.
@@ -143,8 +153,9 @@ tests/              Offline tests (+ opt-in live tests)
 | Symptom | Cause and fix |
 |---------|---------------|
 | `unexpected keyword argument ...` right after code changes | Streamlit is still running old code. Stop it (Ctrl+C) and start it again |
-| `Client.__init__() got an unexpected keyword argument 'proxies'` | Old `anthropic` package. Run `pip install -U anthropic` **inside the `.venv`** |
-| `Your credit balance is too low` | The Anthropic account needs credits (Plans & Billing in the Anthropic console) |
+| `429 RESOURCE_EXHAUSTED` from Gemini | Quota limit on the Vertex key. The app retries with backoff and carries on; if it keeps failing, wait a minute or ask for a higher quota |
+| `404 NOT_FOUND` for a model | Your key cannot use that model name. Try another in the sidebar (for example `gemini-2.5-flash`) |
+| `401` / `403` from Gemini | The Vertex key is wrong, disabled or lacks access (check `VERTEX_API_KEY`) |
 | Semantic Scholar `HTTP 429` in the log | Rate limit. The app retries and continues; set `S2_API_KEY` to reduce it |
 | Citation counts show `n/a` | The lookup was rate limited or the paper has no DOI/PMID match. Searching still works |
 | Every paper shows `ERROR` | Open the Activity log; the traceback says why (key, credits, network) |

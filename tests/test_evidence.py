@@ -3,6 +3,7 @@ error isolation and the second-search pass. The model is replaced by canned answ
 from types import SimpleNamespace
 
 import pytest
+from google.genai import errors as genai_errors
 
 import evidence as ev
 
@@ -98,6 +99,11 @@ def test_verify_quotes_accepts_verbatim_despite_case_spacing_and_dashes():
     assert ok and not bad
 
 
+def test_verify_quotes_treats_math_symbols_as_equal():
+    ok, bad = ev.verify_quotes(["scores >= 270 and change <= 5 (-3)"], "Scores ≥ 270 and change ≤ 5 (−3).")
+    assert ok and not bad
+
+
 def test_verify_quotes_flags_invented_text():
     ok, bad = ev.verify_quotes(["VR cured cancer in every patient."], "VR improved skills.")
     assert bad == ["VR cured cancer in every patient."] and not ok
@@ -168,36 +174,81 @@ def test_build_query_structure_and_cleaning():
 
 
 # ------------------------------------------------------------------ _call_tool
-def _client_returning(*messages):
-    it = iter(messages)
-    return SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: next(it)))
+class FakeModels:
+    """Stands in for client.models: returns/raises the given items in order and records each call."""
+
+    def __init__(self, *items):
+        self.items, self.calls = list(items), []
+
+    def generate_content(self, model, contents, config):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        item = self.items.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return SimpleNamespace(text=item)
 
 
-def _msg(*blocks):
-    return SimpleNamespace(content=list(blocks), stop_reason="end_turn")
+def _client_with(*items):
+    models = FakeModels(*items)
+    return SimpleNamespace(models=models), models
 
 
-TEXT = SimpleNamespace(type="text", text="hello")
-TOOL = SimpleNamespace(type="tool_use", input={"ok": 1})
+def _api_error(code):
+    return genai_errors.ClientError(code, {"error": {"message": f"fake {code}", "status": "X"}})
 
 
-def test_call_tool_returns_tool_input():
-    assert ev._call_tool(_client_returning(_msg(TOOL)), "m", ev.CLAIM_TOOL, "u") == {"ok": 1}
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    monkeypatch.setattr(ev.time, "sleep", lambda s: None)
 
 
-def test_call_tool_retries_once_when_tool_skipped():
-    assert ev._call_tool(_client_returning(_msg(TEXT), _msg(TOOL)), "m", ev.CLAIM_TOOL, "u") == {"ok": 1}
+def test_call_tool_returns_parsed_json_and_sends_schema():
+    client, models = _client_with('{"ok": 1}')
+    assert ev._call_tool(client, "gemini-x", ev.CLAIM_TOOL, "hello") == {"ok": 1}
+    call = models.calls[0]
+    assert call["model"] == "gemini-x" and call["contents"] == "hello"
+    assert call["config"].response_mime_type == "application/json"
+    assert call["config"].response_json_schema == ev.CLAIM_TOOL["input_schema"]
 
 
-def test_call_tool_raises_when_model_never_calls_tool():
-    with pytest.raises(ValueError, match="structured output"):
-        ev._call_tool(_client_returning(_msg(TEXT), _msg(TEXT)), "m", ev.CLAIM_TOOL, "u")
+def test_call_tool_retries_rate_limit_then_succeeds():
+    client, models = _client_with(_api_error(429), _api_error(503), '{"ok": 1}')
+    assert ev._call_tool(client, "m", ev.CLAIM_TOOL, "u") == {"ok": 1}
+    assert len(models.calls) == 3
+
+
+def test_call_tool_retries_bad_json_and_empty_text():
+    client, models = _client_with("not json", None, "[1, 2]", '{"ok": 1}')
+    assert ev._call_tool(client, "m", ev.CLAIM_TOOL, "u") == {"ok": 1}
+    assert len(models.calls) == 4
+
+
+def test_call_tool_gives_up_after_max_attempts():
+    client, models = _client_with(*[_api_error(429)] * 3)
+    with pytest.raises(ValueError, match="after 3 attempts"):
+        ev._call_tool(client, "m", ev.CLAIM_TOOL, "u", max_attempts=3)
+    assert len(models.calls) == 3
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 404])
+def test_call_tool_does_not_retry_auth_billing_or_model_errors(code):
+    client, models = _client_with(_api_error(code), '{"ok": 1}')
+    with pytest.raises(genai_errors.APIError):
+        ev._call_tool(client, "m", ev.CLAIM_TOOL, "u")
+    assert len(models.calls) == 1
+
+
+def test_schemas_are_plain_json_schema_objects():
+    for tool in (ev.CLAIM_TOOL, ev.PAPER_TOOL, ev.QUERY_TOOL):
+        schema = tool["input_schema"]
+        assert schema["type"] == "object" and schema["required"]
+        assert set(schema["required"]) <= set(schema["properties"])
 
 
 # -------------------------------------------------------------- analyze_papers
 @pytest.fixture
 def fake_model(monkeypatch):
-    """Replace the Claude calls; a paper titled 'bad' makes extraction raise."""
+    """Replace the model calls; a paper titled 'bad' makes extraction raise."""
     calls = []
     monkeypatch.setattr(ev, "_client", lambda key: object())
     monkeypatch.setattr(ev, "decompose_claim", lambda c, m, claim: CI3)
@@ -260,3 +311,152 @@ def test_deeper_pass_keeps_abstractless_papers_when_allowed(monkeypatch, fake_mo
     monkeypatch.setattr(ev, "run_search", lambda q, n, medical, enrich: (found, []))
     out = ev.deeper_pass("k", "m", "claim", CI5, [], 5, True, False, only_abstract=False)
     assert out["results"][0]["label"] == "INSUFFICIENT_EVIDENCE"
+
+
+# ======================================================================================
+# Added with the search planner / population check / CONTRADICTS caps / thin-result flag
+# ======================================================================================
+
+# ------------------------------------------------------ CONTRADICTS needs care too
+def contra(**over):
+    return facts(proposed_label="CONTRADICTS",
+                 outcomes=[{"name": "OSATS", "level": 3, "result": "no_difference"}], sample_size=80, **over)
+
+
+def test_clean_contradiction_from_a_decent_study_is_kept():
+    out = ev.apply_guardrails(CI3, contra())
+    assert out["label"] == "CONTRADICTS" and out["guardrail_notes"] == []
+
+
+@pytest.mark.parametrize("over", [
+    {"intervention_match": "mixed"}, {"intervention_match": "variant"},
+    {"population_match": "partial"}, {"population_match": "different"},
+    {"comparator_match": "partial"}, {"comparator_match": "not_matching"}, {"comparator_match": "none"},
+])
+def test_contradiction_from_a_mismatched_study_is_capped_at_mixed(over):
+    out = ev.apply_guardrails(CI3, contra(**over))
+    assert out["label"] == "MIXED" and out["guardrail_notes"]
+
+
+def test_contradiction_from_a_tiny_study_is_capped_at_mixed():
+    out = ev.apply_guardrails(CI3, facts(proposed_label="CONTRADICTS", sample_size=26,
+                                         outcomes=[{"name": "x", "level": 3, "result": "no_difference"}]))
+    assert out["label"] == "MIXED" and "small study" in out["guardrail_notes"][0]
+
+
+def test_small_sample_cap_does_not_apply_to_reviews_or_unknown_n():
+    for over in ({"study_design": "meta_analysis", "sample_size": 10}, {"sample_size": None}):
+        out = ev.apply_guardrails(CI3, contra(**{k: v for k, v in over.items() if k != "sample_size"}) | over)
+        assert out["label"] == "CONTRADICTS"
+
+
+# ------------------------------------------------------------ population check
+@pytest.mark.parametrize("pm", ["partial", "different"])
+def test_population_mismatch_caps_support_and_makes_it_indirect(pm):
+    out = ev.apply_guardrails(CI3, facts(population_match=pm))
+    assert out["label"] == "PARTIALLY_SUPPORTS" and out["directness"] == "indirect" and out["strength"] == "indirect"
+
+
+def test_missing_population_match_is_treated_as_matching():
+    assert ev.apply_guardrails(CI3, facts())["label"] == "SUPPORTS"  # older results have no such field
+
+
+def test_paper_schema_requires_population_match():
+    schema = ev.PAPER_TOOL["input_schema"]
+    assert "population_match" in schema["required"]
+    assert schema["properties"]["population_match"]["enum"] == ["matches", "partial", "different"]
+
+
+# ------------------------------------------------------------ thin-result flag
+def test_thin_result_flag():
+    few = {i: res("SUPPORTS") for i in range(ev.THIN_RESULT_THRESHOLD - 1)}
+    enough = {i: res("SUPPORTS") for i in range(ev.THIN_RESULT_THRESHOLD)}
+    assert ev.summarize(CI3, few)["thin"] and ev.summarize(CI3, few)["n_checked"] == ev.THIN_RESULT_THRESHOLD - 1
+    assert not ev.summarize(CI3, enough)["thin"]
+
+
+def test_errors_do_not_count_as_checked_papers():
+    results = {i: res("SUPPORTS") for i in range(ev.THIN_RESULT_THRESHOLD)}
+    results[0] = res("ERROR", 0)
+    assert ev.summarize(CI3, results)["thin"]
+
+
+# --------------------------------------------------------------- query builders
+TERMS = {"intervention_terms": ["virtual reality", "VR simulator"], "context_terms": ["surgical training"],
+         "outcome_terms": ["technical skills", "OSATS"]}
+
+
+def test_build_query_skips_empty_groups():
+    q = ev.build_query({**TERMS, "outcome_terms": []})
+    assert q == '("virtual reality"[tiab] OR "VR simulator"[tiab]) AND ("surgical training"[tiab])'
+    assert ev.build_query({"intervention_terms": [], "context_terms": [" "], "outcome_terms": []}) == ""
+
+
+def test_search_queries_give_each_source_its_own_syntax():
+    q = ev.search_queries(TERMS)
+    assert "[tiab]" in q["pubmed"] and "AND" in q["pubmed"]
+    assert q["semanticscholar"] == "virtual reality surgical training technical skills"   # plain text, no tags
+    relaxed = ev.search_queries(TERMS, relaxed=True)
+    assert "technical skills" not in relaxed["pubmed"] and relaxed["semanticscholar"] == "virtual reality surgical training"
+
+
+# ---------------------------------------------------------------- plan_and_search
+def _papers(n, prefix="p"):
+    return [{"title": f"{prefix}{i}", "doi": f"10.1/{prefix}{i}", "pmid": None, "abstract": "a"} for i in range(n)]
+
+
+@pytest.fixture
+def planner(monkeypatch):
+    """Fake the model's search terms and the search backend; records every query used."""
+    monkeypatch.setattr(ev, "_client", lambda key: object())
+    monkeypatch.setattr(ev, "_call_tool", lambda *a, **k: {**TERMS, "explanation": "why"})
+    monkeypatch.setattr(ev, "enrich_citations", lambda papers: None)
+    seen, answers = [], {}
+
+    def fake_run_search(query, limit, medical, enrich=True):
+        seen.append(query)
+        return answers.get(len(seen), []), []
+
+    monkeypatch.setattr(ev, "run_search", fake_run_search)
+    return seen, answers
+
+
+def test_plan_uses_structured_query_not_the_raw_sentence(planner):
+    seen, answers = planner
+    answers[1] = _papers(12)
+    papers, errors, plan = ev.plan_and_search("k", "m", "A long claim sentence that improves things.", 15, True, False)
+    assert len(papers) == 12 and not plan["relaxed_used"] and plan["relaxed"] is None
+    assert len(seen) == 1 and isinstance(seen[0], dict) and "claim sentence" not in seen[0]["pubmed"]
+
+
+def test_plan_relaxes_when_precise_query_finds_too_few(planner):
+    seen, answers = planner
+    answers[1], answers[2] = _papers(2), _papers(14, "r")
+    papers, _, plan = ev.plan_and_search("k", "m", "claim", 15, True, False)
+    assert len(papers) == 14 and plan["relaxed_used"] and plan["precise_count"] == 2 and plan["relaxed_count"] == 14
+    assert len(seen) == 2 and "technical skills" not in seen[1]["pubmed"]
+    assert plan["queries"] == seen[1]
+
+
+def test_plan_keeps_precise_results_if_relaxing_does_not_help(planner):
+    seen, answers = planner
+    answers[1], answers[2] = _papers(3), _papers(1, "r")
+    papers, _, plan = ev.plan_and_search("k", "m", "claim", 15, True, False)
+    assert len(papers) == 3 and not plan["relaxed_used"] and plan["relaxed_count"] == 1
+
+
+def test_plan_enriches_only_the_final_list(monkeypatch, planner):
+    seen, answers = planner
+    answers[1], answers[2] = _papers(1), _papers(9, "r")
+    enriched = []
+    monkeypatch.setattr(ev, "enrich_citations", lambda papers: enriched.append(len(papers)))
+    ev.plan_and_search("k", "m", "claim", 15, True, enrich=True)
+    assert enriched == [9]
+
+
+def test_plan_rejects_unusable_terms(monkeypatch):
+    monkeypatch.setattr(ev, "_client", lambda key: object())
+    monkeypatch.setattr(ev, "_call_tool", lambda *a, **k: {"intervention_terms": [], "context_terms": [],
+                                                           "outcome_terms": [], "explanation": ""})
+    with pytest.raises(ValueError, match="no usable search terms"):
+        ev.plan_and_search("k", "m", "claim", 15, True, False)

@@ -308,7 +308,7 @@ def enrich_citations(papers: list[dict]) -> None:
     log.warning("Citation enrichment gave up; citation counts left empty.")
 
 
-def run_search(query: str, limit: int, medical: bool, enrich: bool = True) -> tuple[list[dict], list[str]]:
+def run_search(query: "str | dict[str, str]", limit: int, medical: bool, enrich: bool = True) -> tuple[list[dict], list[str]]:
     """Run the routed search. Returns (papers, errors); one source failing doesn't kill the other."""
     errors, results = [], []
     sources = [("PubMed", search_pubmed)] if medical else [("Semantic Scholar", search_semantic_scholar),
@@ -316,7 +316,9 @@ def run_search(query: str, limit: int, medical: bool, enrich: bool = True) -> tu
     log.info("Routing: %s", "medical -> PubMed only" if medical else "general -> both sources")
     for name, fn in sources:
         try:
-            results.append(fn(query, limit))
+            # `query` may be one string for every source, or {"pubmed": ..., "semanticscholar": ...}
+            q = query.get(name.lower().replace(" ", ""), "") if isinstance(query, dict) else query
+            results.append(fn(q, limit))
         except SearchError as e:
             log.error("%s failed: %s", name, e)
             errors.append(f"{name}: {e}")

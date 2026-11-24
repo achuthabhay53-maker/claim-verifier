@@ -235,6 +235,22 @@ def test_run_search_unexpected_exception_is_reported_not_raised(monkeypatch):
     assert len(papers) == 1 and "unexpected error" in errors[0]
 
 
+def test_run_search_gives_each_source_its_own_query(monkeypatch):
+    got = {}
+    monkeypatch.setattr(fp, "search_semantic_scholar", lambda q, n: got.setdefault("s2", q) and [])
+    monkeypatch.setattr(fp, "search_pubmed", lambda q, n: got.setdefault("pm", q) and [])
+    fp.run_search({"pubmed": '"vr"[tiab]', "semanticscholar": "vr training"}, 5, medical=False, enrich=False)
+    assert got == {"s2": "vr training", "pm": '"vr"[tiab]'}
+
+
+def test_run_search_still_accepts_a_single_string(monkeypatch):
+    got = []
+    monkeypatch.setattr(fp, "search_semantic_scholar", lambda q, n: got.append(q) or [])
+    monkeypatch.setattr(fp, "search_pubmed", lambda q, n: got.append(q) or [])
+    fp.run_search("one query", 5, medical=False, enrich=False)
+    assert got == ["one query", "one query"]
+
+
 # ----------------------------------------------------------------------- .env
 def test_load_env_reads_values_and_skips_empty(monkeypatch, tmp_path):
     (tmp_path / ".env").write_text("# comment\nTEST_FP_KEY='abc'\nTEST_FP_EMPTY=\n", encoding="utf-8")
