@@ -120,7 +120,7 @@ and the full traceback for any failure.
 ## GitHub automation (Gemini)
 
 Both workflows use [`google-github-actions/run-gemini-cli`](https://github.com/google-github-actions/run-gemini-cli)
-and need one repository secret named `GEMINI_API_KEY` (Settings > Secrets and variables > Actions; get a key
+and need one repository secret named `VERTEX_API_KEY` (Settings > Secrets and variables > Actions; get a key
 from Google AI Studio).
 
 | Workflow | What it does |

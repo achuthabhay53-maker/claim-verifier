@@ -30,7 +30,6 @@ jobs:
     timeout-minutes: 15
     env:
       HAS_GEMINI: ${{ secrets.GEMINI_API_KEY != '' }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -71,14 +70,15 @@ jobs:
       - name: Ask Gemini to analyse the result
         id: gemini
         if: ${{ !cancelled() && env.HAS_GEMINI == 'true' }}
+        continue-on-error: true   # a Gemini outage or billing problem must not mark passing tests as failed
         uses: google-github-actions/run-gemini-cli@v0
         env:
           # Nobody can click "trust this folder" in CI. Safe here: this job only runs our own default branch.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          gemini_api_key: ${{ secrets.VERTEX_API_KEY }}
           settings: |
-            { "maxSessionTurns": 10 }
+            { "maxSessionTurns": 10, "tools": { "exclude": ["run_shell_command", "write_file", "replace"] } }
           prompt: |
             You are a maintainer assistant for a small Python project (a Streamlit app that finds research
             papers and checks whether they support a claim). The daily offline test run finished with
@@ -114,6 +114,7 @@ jobs:
         if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           REPORT: ${{ steps.gemini.outputs.summary }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
