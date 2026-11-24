@@ -72,6 +72,9 @@ jobs:
         id: gemini
         if: ${{ !cancelled() && env.HAS_GEMINI == 'true' }}
         uses: google-github-actions/run-gemini-cli@v0
+        env:
+          # Nobody can click "trust this folder" in CI. Safe here: this job only runs our own default branch.
+          GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           settings: |
