@@ -66,7 +66,9 @@ jobs:
           # default branch (never fork code), and only trusted commenters can trigger it.
           GEMINI_CLI_TRUST_WORKSPACE: 'true'
         with:
-          vertex_api_key: ${{ secrets.VERTEX_API_KEY }}
+          # Vertex AI API key mode: the action needs BOTH of these (the key alone leaves Vertex mode off)
+          google_api_key: ${{ secrets.VERTEX_API_KEY }}
+          use_vertex_ai: 'true'
           settings: |
             { "maxSessionTurns": 15, "tools": { "exclude": ["run_shell_command", "write_file", "replace"] } }
           prompt: |
